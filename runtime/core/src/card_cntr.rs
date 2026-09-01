@@ -24,6 +24,16 @@ pub trait CtlModel<O: Sized> {
         elem_id: &ElemId,
         elem_value: &ElemValue,
     ) -> Result<bool, Error>;
+
+    /// Optional hook after a successful userspace write (e.g. program recall defer).
+    fn refresh_after_write(
+        &mut self,
+        _card_cntr: &mut CardCntr,
+        _unit: &mut O,
+        _elem_id: &ElemId,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub trait MeasureModel<O: Sized> {
@@ -474,6 +484,16 @@ impl CardCntr {
         Ok(elem_id_list)
     }
 
+    /// Update the cached userspace value for an element after rewriting hardware state.
+    pub fn store_elem_value(&mut self, elem_id: &ElemId, elem_value: &ElemValue) {
+        for (info, cached) in &mut self.entries {
+            if match_elem_id(info, elem_id) {
+                *cached = elem_value.clone();
+                break;
+            }
+        }
+    }
+
     pub fn dispatch_elem_event<O, T>(
         &mut self,
         unit: &mut O,
@@ -544,6 +564,8 @@ impl CardCntr {
         if events.contains(ElemEventMask::VALUE) {
             let _enter = debug_span!("value").entered();
 
+            let mut wrote = false;
+
             for (elem_info, v) in &mut self.entries {
                 if !match_elem_id(elem_info, elem_id) {
                     continue;
@@ -590,13 +612,18 @@ impl CardCntr {
                 if let Ok(res) = res {
                     if res {
                         *v = val;
-                        return Ok(());
+                        wrote = true;
+                        break;
                     }
                 } else {
                     // Back to old values.
                     self.card.write_elem_value(&elem_id, v)?;
                     res?;
                 }
+            }
+
+            if wrote {
+                ctl_model.refresh_after_write(self, unit, elem_id)?;
             }
         }
 
@@ -681,9 +708,14 @@ impl CardCntr {
                         values = value_array_literal(elem_info, &elem_value),
                         ?res,
                     );
-                    res?;
-
                     _enter.exit();
+
+                    // Ok(false) means the model declined this element (deferred
+                    // program-slot sync), so there is nothing to push to the kernel.
+                    // Err must still reach the caller.
+                    if !res? {
+                        return Ok(());
+                    }
 
                     let _enter = debug_span!("kernel").entered();
                     let res = card.write_elem_value(elem_id, elem_value);
@@ -692,7 +724,6 @@ impl CardCntr {
                         values = value_array_literal(elem_info, &elem_value),
                         ?res,
                     );
-
                     _enter.exit();
 
                     res
