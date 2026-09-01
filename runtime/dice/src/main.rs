@@ -34,7 +34,7 @@ use {
     protocols::tcat::{global_section::*, *},
     runtime_core::{card_cntr::*, cmdline::*, dispatcher::*, LogLevel, *},
     std::{fmt::Debug, sync::mpsc},
-    tracing::{debug, debug_span, Level},
+    tracing::{debug, debug_span, warn, Level},
 };
 
 enum Event {
@@ -44,6 +44,7 @@ enum Event {
     Elem(ElemId, ElemEventMask),
     Notify(u32),
     Timer,
+    BackgroundPoll,
 }
 
 struct DiceRuntime {
@@ -54,6 +55,7 @@ struct DiceRuntime {
     tx: mpsc::SyncSender<Event>,
     dispatchers: Vec<Dispatcher>,
     timer: Option<Dispatcher>,
+    background: Option<Dispatcher>,
 }
 
 impl RuntimeOperation<u32> for DiceRuntime {
@@ -84,6 +86,7 @@ impl RuntimeOperation<u32> for DiceRuntime {
         let dispatchers = Vec::new();
 
         let timer = None;
+        let background = None;
 
         Ok(DiceRuntime {
             unit: (unit, node),
@@ -93,6 +96,7 @@ impl RuntimeOperation<u32> for DiceRuntime {
             tx,
             dispatchers,
             timer,
+            background,
         })
     }
 
@@ -110,6 +114,9 @@ impl RuntimeOperation<u32> for DiceRuntime {
         if self.model.measured_elem_list.len() > 0 {
             let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, Self::TIMER_NAME, 0);
             let _ = self.card_cntr.add_bool_elems(&elem_id, 1, 1, true)?;
+        }
+        if self.model.needs_background_timer() {
+            self.start_background_timer()?;
         }
         enter.exit();
 
@@ -182,6 +189,22 @@ impl RuntimeOperation<u32> for DiceRuntime {
                         .model
                         .measure_elems(&mut self.unit, &mut self.card_cntr);
                 }
+                Event::BackgroundPoll => {
+                    let _enter = debug_span!("background").entered();
+                    if let Err(cause) = self
+                        .model
+                        .poll_background(&mut self.unit, &mut self.card_cntr)
+                    {
+                        if self.model.defer_program_slot_sync_active() {
+                            warn!(
+                                "background poll failed during preset recall defer: {}",
+                                cause
+                            );
+                        } else {
+                            debug!("background poll failed: {}", cause);
+                        }
+                    }
+                }
             }
         }
 
@@ -194,7 +217,12 @@ impl RuntimeOperation<u32> for DiceRuntime {
 impl Drop for DiceRuntime {
     fn drop(&mut self) {
         // At first, stop event loop in all of dispatchers to avoid queueing new events.
-        for dispatcher in &mut self.dispatchers {
+        for dispatcher in self
+            .dispatchers
+            .iter_mut()
+            .chain(self.timer.iter_mut())
+            .chain(self.background.iter_mut())
+        {
             dispatcher.stop();
         }
 
@@ -202,6 +230,8 @@ impl Drop for DiceRuntime {
         for _ in self.rx.try_iter() {}
 
         // Finally Finish I/O threads.
+        self.timer = None;
+        self.background = None;
         self.dispatchers.clear();
     }
 }
@@ -210,9 +240,13 @@ impl DiceRuntime {
     const NODE_DISPATCHER_NAME: &'static str = "node event dispatcher";
     const SYSTEM_DISPATCHER_NAME: &'static str = "system event dispatcher";
     const TIMER_DISPATCHER_NAME: &'static str = "interval timer dispatcher";
+    const BACKGROUND_DISPATCHER_NAME: &'static str = "background poll dispatcher";
 
     const TIMER_NAME: &'static str = "metering";
     const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Recall detection re-reads six device segments per tick, so it runs far slower
+    /// than metering to keep the IEEE 1394 bus usable while a preset loads.
+    const BACKGROUND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
     fn launch_node_event_dispatcher(&mut self) -> Result<(), Error> {
         let name = Self::NODE_DISPATCHER_NAME.to_string();
@@ -282,6 +316,21 @@ impl DiceRuntime {
 
     fn stop_interval_timer(&mut self) {
         self.timer = None;
+    }
+
+    /// Recall detection must keep running whether or not userspace enabled metering,
+    /// so it gets its own dispatcher instead of sharing the `metering` element's timer.
+    fn start_background_timer(&mut self) -> Result<(), Error> {
+        let mut dispatcher = Dispatcher::run(Self::BACKGROUND_DISPATCHER_NAME.to_string())?;
+        let tx = self.tx.clone();
+        dispatcher.attach_interval_handler(Self::BACKGROUND_INTERVAL, move || {
+            let _ = tx.send(Event::BackgroundPoll);
+            glib::ControlFlow::Continue
+        });
+
+        self.background = Some(dispatcher);
+
+        Ok(())
     }
 }
 

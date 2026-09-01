@@ -327,6 +327,28 @@ impl DiceModel {
         Ok(())
     }
 
+    pub fn needs_background_timer(&self) -> bool {
+        matches!(self.model, Model::TcStudiok48(_))
+    }
+
+    pub fn defer_program_slot_sync_active(&self) -> bool {
+        match &self.model {
+            Model::TcStudiok48(m) => m.defer_program_slot_sync_active(),
+            _ => false,
+        }
+    }
+
+    pub fn poll_background(
+        &mut self,
+        unit: &mut (SndDice, FwNode),
+        card_cntr: &mut CardCntr,
+    ) -> Result<(), Error> {
+        match &mut self.model {
+            Model::TcStudiok48(m) => m.poll_program_slot_sync(unit, card_cntr),
+            _ => Ok(()),
+        }
+    }
+
     pub fn dispatch_elem_event(
         &mut self,
         unit: &mut (SndDice, FwNode),
@@ -338,7 +360,10 @@ impl DiceModel {
             Model::Minimal(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
             Model::TcK24d(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
             Model::TcK8(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
-            Model::TcStudiok48(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
+            Model::TcStudiok48(m) => {
+                card_cntr.dispatch_elem_event(unit, &elem_id, &events, m)?;
+                m.poll_program_slot_sync(unit, card_cntr)
+            }
             Model::TcKlive(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
             Model::TcDesktopk6(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
             Model::TcItwin(m) => card_cntr.dispatch_elem_event(unit, &elem_id, &events, m),
@@ -400,7 +425,13 @@ impl DiceModel {
                 card_cntr.dispatch_notification(unit, &msg, &self.notified_elem_list, m)
             }
             Model::TcStudiok48(m) => {
-                card_cntr.dispatch_notification(unit, &msg, &self.notified_elem_list, m)
+                let mixer_notify = m.is_mixer_state_notified(msg);
+                card_cntr.dispatch_notification(unit, &msg, &self.notified_elem_list, m)?;
+                if mixer_notify && m.defer_program_slot_sync_active() {
+                    m.complete_program_slot_sync(&unit.1, card_cntr)
+                } else {
+                    m.poll_program_slot_sync(unit, card_cntr)
+                }
             }
             Model::TcKlive(m) => {
                 card_cntr.dispatch_notification(unit, &msg, &self.notified_elem_list, m)
