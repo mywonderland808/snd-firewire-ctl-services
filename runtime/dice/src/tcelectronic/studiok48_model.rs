@@ -11,7 +11,23 @@ use {
     },
     protocols::tcat::global_section::ClockRate,
     protocols::tcelectronic::studio::*,
+    std::time::Instant,
 };
+
+/// Cached program-slot state used to detect end of remote preset recall.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ProgramSlotBody {
+    lineout: StudioLineOutLevel,
+    config: StudioConfig,
+    mixer: StudioMixerState,
+    phys: StudioPhysOut,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ProgramSlotSnapshot {
+    prog: TcKonnektLoadedProgram,
+    body: ProgramSlotBody,
+}
 
 #[derive(Default, Debug)]
 pub struct Studiok48Model {
@@ -29,9 +45,35 @@ pub struct Studiok48Model {
     reverb_state_ctl: ReverbStateCtl<Studiok48Protocol, StudioReverbState>,
     reverb_meter_ctl: ReverbMeterCtl<Studiok48Protocol, StudioReverbMeter>,
     hw_state_ctl: HwStateCtl,
+    /// Skip syncing per-program mixer/phys/routing until composite mixer notify.
+    defer_program_slot_sync: bool,
+    program_slot_poll_since: Option<Instant>,
+    program_slot_poll_last_at: Option<Instant>,
+    program_slot_body_at_change: Option<ProgramSlotBody>,
+    program_slot_poll_last: Option<ProgramSlotSnapshot>,
+    program_slot_poll_stable: u8,
 }
 
 const TIMEOUT_MS: u32 = 20;
+/// Minimum wait before treating stable polls as recall-complete (DSP needs time).
+const PROGRAM_SLOT_POLL_MIN_MS: u128 = 500;
+/// When mixer/phys are identical across presets, still sync after this delay.
+const PROGRAM_SLOT_IDENTICAL_PRESET_MS: u128 = 5_000;
+/// Fallback when composite mixer notify never arrives.
+const PROGRAM_SLOT_RECALL_TIMEOUT_MS: u128 = 60_000;
+const PROGRAM_SLOT_POLL_STABLE_COUNT: u8 = 2;
+/// Floor on the spacing between recall polls. Element writes and notifications also drive
+/// the poll, so without this a burst of either would issue one segment read round per event.
+/// Kept below the runtime's background interval so that cadence is never throttled itself.
+const PROGRAM_SLOT_POLL_MIN_INTERVAL_MS: u128 = 100;
+
+/// Whether enough time has passed since the previous recall poll to read the device again.
+fn program_slot_poll_due(last_at: Option<Instant>) -> bool {
+    match last_at {
+        Some(at) => at.elapsed().as_millis() >= PROGRAM_SLOT_POLL_MIN_INTERVAL_MS,
+        None => true,
+    }
+}
 
 fn src_index_in(entry: &SrcEntry, table: &[SrcEntry], what: &str) -> Result<u32, Error> {
     table
@@ -108,6 +150,10 @@ impl CtlModel<(SndDice, FwNode)> for Studiok48Model {
     }
 
     fn read(&mut self, elem_id: &ElemId, elem_value: &mut ElemValue) -> Result<bool, Error> {
+        if self.defer_program_slot_sync && self.is_program_slot_sync_elem(elem_id) {
+            return Ok(false);
+        }
+
         if self.common_ctl.read(elem_id, elem_value)? {
             Ok(true)
         } else if self.lineout_ctl.read(elem_id, elem_value)? {
@@ -206,6 +252,211 @@ impl CtlModel<(SndDice, FwNode)> for Studiok48Model {
             Ok(false)
         }
     }
+
+    fn refresh_after_write(
+        &mut self,
+        _card_cntr: &mut CardCntr,
+        _unit: &mut (SndDice, FwNode),
+        elem_id: &ElemId,
+    ) -> Result<(), Error> {
+        if elem_id.name().as_str() == LOADED_PROGRAM_ELEM_NAME {
+            let body_at_change = self.program_slot_body_snapshot();
+            self.mark_defer_program_slot_sync(body_at_change);
+        }
+        Ok(())
+    }
+}
+
+impl Studiok48Model {
+    /// True when the notification carries recalled mixer state.
+    ///
+    /// The flag itself belongs to the protocol crate; asking the segment keeps the
+    /// runtime from drifting out of sync with it.
+    pub fn is_mixer_state_notified(&self, msg: u32) -> bool {
+        Studiok48Protocol::is_notified_segment(&self.mixer_state_ctl.0, msg)
+    }
+
+    pub fn defer_program_slot_sync_active(&self) -> bool {
+        self.defer_program_slot_sync
+    }
+
+    fn program_slot_body_snapshot(&self) -> ProgramSlotBody {
+        ProgramSlotBody {
+            lineout: self.lineout_ctl.0.data,
+            config: self.config_ctl.0.data,
+            mixer: self.mixer_state_ctl.0.data,
+            phys: self.phys_out_ctl.0.data,
+        }
+    }
+
+    fn program_slot_state_snapshot(&self) -> ProgramSlotSnapshot {
+        ProgramSlotSnapshot {
+            prog: self.remote_ctl.0.data.prog,
+            body: self.program_slot_body_snapshot(),
+        }
+    }
+
+    fn clear_program_slot_poll(&mut self) {
+        self.program_slot_poll_since = None;
+        self.program_slot_poll_last_at = None;
+        self.program_slot_body_at_change = None;
+        self.program_slot_poll_last = None;
+        self.program_slot_poll_stable = 0;
+    }
+
+    fn begin_program_slot_poll(&mut self, body_at_change: ProgramSlotBody) {
+        self.program_slot_body_at_change = Some(body_at_change);
+        self.program_slot_poll_last = None;
+        self.program_slot_poll_stable = 0;
+        self.program_slot_poll_since = Some(Instant::now());
+        // First poll after a recall starts must not be throttled.
+        self.program_slot_poll_last_at = None;
+    }
+
+    fn mark_defer_program_slot_sync(&mut self, body_at_change: ProgramSlotBody) {
+        self.defer_program_slot_sync = true;
+        self.begin_program_slot_poll(body_at_change);
+        debug!("program slot sync deferred until mixer notify or poll completion");
+    }
+
+    /// Segments that make up [`ProgramSlotBody`], i.e. the ones recall detection compares.
+    fn cache_program_slot_recall_segments(&mut self, node: &FwNode) -> Result<(), Error> {
+        self.lineout_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.config_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.mixer_state_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.phys_out_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        Ok(())
+    }
+
+    /// Reverb and channel-strip state is published on recall but never compared, so it is
+    /// read once when the recall settles rather than on every poll.
+    fn cache_program_slot_effect_segments(&mut self, node: &FwNode) -> Result<(), Error> {
+        self.reverb_state_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.ch_strip_state_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        Ok(())
+    }
+
+    fn program_slot_elem_ids(&self) -> Vec<ElemId> {
+        let mut ids = Vec::new();
+        ids.extend_from_slice(&self.lineout_ctl.1);
+        ids.extend_from_slice(&self.config_ctl.1);
+        ids.extend_from_slice(&self.mixer_state_ctl.1);
+        ids.extend_from_slice(&self.phys_out_ctl.1);
+        ids.extend_from_slice(&self.reverb_state_ctl.elem_id_list);
+        ids.extend_from_slice(&self.ch_strip_state_ctl.elem_id_list);
+        ids
+    }
+
+    fn sync_program_slot_elems_to_alsa(&mut self, card_cntr: &mut CardCntr) -> Result<(), Error> {
+        for elem_id in self.program_slot_elem_ids() {
+            self.sync_elem_value(card_cntr, &elem_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_program_slot_sync(
+        &mut self,
+        node: &FwNode,
+        card_cntr: &mut CardCntr,
+    ) -> Result<(), Error> {
+        self.cache_program_slot_recall_segments(node)?;
+        self.cache_program_slot_effect_segments(node)?;
+        debug!("program slot recall sync complete");
+        self.defer_program_slot_sync = false;
+        self.clear_program_slot_poll();
+        self.sync_program_slot_elems_to_alsa(card_cntr)
+    }
+
+    /// Poll device segments while defer is active; push ALSA values when recall stabilizes.
+    pub fn poll_program_slot_sync(
+        &mut self,
+        (_, node): &mut (SndDice, FwNode),
+        card_cntr: &mut CardCntr,
+    ) -> Result<(), Error> {
+        if !self.defer_program_slot_sync {
+            return Ok(());
+        }
+
+        let since = match self.program_slot_poll_since {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        if !program_slot_poll_due(self.program_slot_poll_last_at) {
+            return Ok(());
+        }
+        self.program_slot_poll_last_at = Some(Instant::now());
+
+        self.cache_program_slot_recall_segments(node)?;
+
+        let snapshot = self.program_slot_state_snapshot();
+        let elapsed = since.elapsed().as_millis();
+        let changed_from_start = self
+            .program_slot_body_at_change
+            .as_ref()
+            .map_or(true, |start| start != &snapshot.body);
+
+        if let Some(last) = &self.program_slot_poll_last {
+            if snapshot == *last {
+                self.program_slot_poll_stable = self.program_slot_poll_stable.saturating_add(1);
+            } else {
+                self.program_slot_poll_stable = 1;
+            }
+        } else {
+            self.program_slot_poll_stable = 1;
+        }
+        self.program_slot_poll_last = Some(snapshot);
+
+        let timed_out = elapsed >= PROGRAM_SLOT_RECALL_TIMEOUT_MS;
+        let min_elapsed = elapsed >= PROGRAM_SLOT_POLL_MIN_MS;
+        let identical_elapsed = elapsed >= PROGRAM_SLOT_IDENTICAL_PRESET_MS;
+        let stable = self.program_slot_poll_stable >= PROGRAM_SLOT_POLL_STABLE_COUNT;
+
+        if timed_out
+            || (stable && min_elapsed && changed_from_start)
+            || (stable && identical_elapsed && !changed_from_start)
+        {
+            self.complete_program_slot_sync(node, card_cntr)?;
+        }
+
+        Ok(())
+    }
+
+    fn elem_in_list(elem_id: &ElemId, list: &[ElemId]) -> bool {
+        list.iter().any(|e| {
+            e.name() == elem_id.name()
+                && e.iface() == elem_id.iface()
+                && e.device_id() == elem_id.device_id()
+                && e.subdevice_id() == elem_id.subdevice_id()
+        })
+    }
+
+    fn is_program_slot_sync_elem(&self, elem_id: &ElemId) -> bool {
+        [
+            &self.lineout_ctl.1[..],
+            &self.config_ctl.1[..],
+            &self.mixer_state_ctl.1[..],
+            &self.phys_out_ctl.1[..],
+            &self.reverb_state_ctl.elem_id_list[..],
+            &self.ch_strip_state_ctl.elem_id_list[..],
+        ]
+        .iter()
+        .any(|list| Self::elem_in_list(elem_id, list))
+    }
+
+    fn sync_elem_value(
+        &mut self,
+        card_cntr: &mut CardCntr,
+        elem_id: &ElemId,
+    ) -> Result<(), Error> {
+        let mut val = ElemValue::new();
+        if !self.read(elem_id, &mut val)? {
+            return Ok(());
+        }
+        card_cntr.card.write_elem_value(elem_id, &val)?;
+        card_cntr.store_elem_value(elem_id, &val);
+        Ok(())
+    }
 }
 
 impl NotifyModel<(SndDice, FwNode), u32> for Studiok48Model {
@@ -223,15 +474,23 @@ impl NotifyModel<(SndDice, FwNode), u32> for Studiok48Model {
 
     fn parse_notification(
         &mut self,
-        (_, node): &mut (SndDice, FwNode),
+        unit: &mut (SndDice, FwNode),
         &msg: &u32,
     ) -> Result<(), Error> {
+        let node = &unit.1;
         self.common_ctl
             .parse_notification(&self.req, node, &mut self.sections, msg, TIMEOUT_MS)?;
         self.lineout_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
+
+        let body_at_recall = self.program_slot_body_snapshot();
+        let prog_before = self.remote_ctl.0.data.prog;
         self.remote_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
+        if prog_before != self.remote_ctl.0.data.prog {
+            self.mark_defer_program_slot_sync(body_at_recall);
+        }
+
         self.config_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
         self.mixer_state_ctl
@@ -2617,6 +2876,34 @@ impl HwStateCtl {
 
 #[cfg(test)]
 impl Studiok48Model {
+    fn test_defer_slot_sync(&self) -> bool {
+        self.defer_program_slot_sync
+    }
+
+    fn test_poll_pending(&self) -> bool {
+        self.program_slot_poll_since.is_some()
+    }
+
+    fn test_set_defer_slot_sync(&mut self, defer: bool) {
+        self.defer_program_slot_sync = defer;
+        if defer {
+            self.begin_program_slot_poll(self.program_slot_body_snapshot());
+        } else {
+            self.clear_program_slot_poll();
+        }
+    }
+
+    fn test_register_mixer_elem(&mut self, name: &str) {
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, name, 0);
+        self.mixer_state_ctl.1.push(elem_id);
+    }
+
+    fn test_mixer_out_vol(&mut self, vol: i32) {
+        for pair in self.mixer_state_ctl.0.data.mixer_out.iter_mut() {
+            pair.vol = vol;
+        }
+    }
+
     fn test_remote_fallback_duration(&mut self, ms: u32) {
         self.remote_ctl.0.data.fallback_to_master_duration = ms;
     }
@@ -2626,6 +2913,41 @@ impl Studiok48Model {
 mod tests {
     use super::*;
     use alsactl::CardError;
+
+    #[test]
+    fn defer_suppresses_program_slot_sync_elems() {
+        let mut model = Studiok48Model::default();
+        model.test_set_defer_slot_sync(true);
+        model.test_register_mixer_elem(OUT_VOL_NAME);
+        model.test_mixer_out_vol(-500);
+
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, OUT_VOL_NAME, 0);
+        let mut val = ElemValue::new();
+        assert!(!model.read(&elem_id, &mut val).unwrap());
+
+        model.test_set_defer_slot_sync(false);
+        assert!(model.read(&elem_id, &mut val).unwrap());
+        assert_eq!(val.int()[0], -500);
+    }
+
+    #[test]
+    fn defer_does_not_block_remote_elems() {
+        let mut model = Studiok48Model::default();
+        model.test_set_defer_slot_sync(true);
+        model.test_remote_fallback_duration(500);
+
+        let elem_id = ElemId::new_by_name(
+            ElemIfaceType::Mixer,
+            0,
+            0,
+            FALLBACK_TO_MASTER_DURATION_NAME,
+            0,
+        );
+        let mut val = ElemValue::new();
+        assert!(model.read(&elem_id, &mut val).unwrap());
+        // Off-grid firmware values map to the nearest TC Near preset (1.0 s).
+        assert_eq!(val.enumerated()[0], 0);
+    }
 
     #[test]
     fn fallback_duration_enum_matches_tc_near() {
@@ -2653,6 +2975,62 @@ mod tests {
         }
         assert_eq!(RemoteCtl::fallback_duration_ms_to_index(500), 0);
         assert_eq!(RemoteCtl::fallback_duration_ms_to_index(1250), 0);
+    }
+
+    /// Flags come from the protocol crate so the test cannot drift from the wire format.
+    fn notify_flag<T>() -> u32
+    where
+        Studiok48Protocol: TcKonnektNotifiedSegmentOperation<T>,
+    {
+        <Studiok48Protocol as TcKonnektNotifiedSegmentOperation<T>>::NOTIFY_FLAG
+    }
+
+    #[test]
+    fn mixer_notify_flag_recognized() {
+        let model = Studiok48Model::default();
+        assert!(!model.is_mixer_state_notified(notify_flag::<StudioRemote>()));
+        assert!(model.is_mixer_state_notified(notify_flag::<StudioMixerState>()));
+    }
+
+    #[test]
+    fn remote_notify_keeps_defer_mixer_notify_completes() {
+        let mut model = Studiok48Model::default();
+        model.test_set_defer_slot_sync(true);
+
+        assert!(!model.is_mixer_state_notified(notify_flag::<StudioRemote>()));
+        assert!(model.test_defer_slot_sync());
+        assert!(model.test_poll_pending());
+
+        assert!(model.is_mixer_state_notified(notify_flag::<StudioMixerState>()));
+        assert!(model.test_defer_slot_sync());
+    }
+
+    #[test]
+    fn poll_throttle_spaces_device_reads() {
+        assert!(program_slot_poll_due(None), "first poll must not be delayed");
+        assert!(
+            !program_slot_poll_due(Some(Instant::now())),
+            "a poll that just ran must not read the device again"
+        );
+
+        let stale = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(
+                PROGRAM_SLOT_POLL_MIN_INTERVAL_MS as u64 + 50,
+            ))
+            .expect("monotonic clock is far enough from its origin");
+        assert!(program_slot_poll_due(Some(stale)));
+    }
+
+    /// The throttle must not swallow the first poll of a freshly started recall, otherwise
+    /// detection would be delayed by a whole interval.
+    #[test]
+    fn recall_start_clears_poll_throttle() {
+        let mut model = Studiok48Model {
+            program_slot_poll_last_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        model.test_set_defer_slot_sync(true);
+        assert!(program_slot_poll_due(model.program_slot_poll_last_at));
     }
 
     #[test]
