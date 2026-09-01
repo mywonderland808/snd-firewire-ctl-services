@@ -3,7 +3,9 @@
 
 use super::*;
 
-const LOADED_NAME: &str = "loaded-program";
+pub const LOADED_PROGRAM_ELEM_NAME: &str = "loaded-program";
+
+const LOADED_NAME: &str = LOADED_PROGRAM_ELEM_NAME;
 
 const LOADED_PROGRAMS: &[TcKonnektLoadedProgram] = &[
     TcKonnektLoadedProgram::P0,

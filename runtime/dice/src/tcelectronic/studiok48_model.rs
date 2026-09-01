@@ -305,17 +305,19 @@ fn nominal_signal_level_to_str(level: &NominalSignalLevel) -> &'static str {
 }
 
 #[derive(Default, Debug)]
+/// Line-in sensitivity for analog inputs 5–12 (wire segment is `StudioLineOutLevel`).
 struct LineoutCtl(Studiok48LineOutLevelSegment, Vec<ElemId>);
 
-const LINE_OUT_45_LEVEL_NAME: &str = "line-out-5/6-level";
-const LINE_OUT_67_LEVEL_NAME: &str = "line-out-7/8-level";
-const LINE_OUT_89_LEVEL_NAME: &str = "line-out-9/10-level";
-const LINE_OUT_1011_LEVEL_NAME: &str = "line-out-11/12-level";
+const LINE_IN_45_SENSITIVITY_NAME: &str = "line-in-5/6-sensitivity";
+const LINE_IN_67_SENSITIVITY_NAME: &str = "line-in-7/8-sensitivity";
+const LINE_IN_89_SENSITIVITY_NAME: &str = "line-in-9/10-sensitivity";
+const LINE_IN_1011_SENSITIVITY_NAME: &str = "line-in-11/12-sensitivity";
 
 impl LineoutCtl {
+    // Enum order matches TC Near: index 0 = -10 dBV (Consumer), index 1 = +4 dBu (Professional).
     const NOMINAL_SIGNAL_LEVELS: [NominalSignalLevel; 2] = [
-        NominalSignalLevel::Professional,
         NominalSignalLevel::Consumer,
+        NominalSignalLevel::Professional,
     ];
 
     fn cache(&mut self, req: &FwReq, node: &FwNode, timeout_ms: u32) -> Result<(), Error> {
@@ -328,22 +330,22 @@ impl LineoutCtl {
         let labels =
             elements_to_str_vector(&Self::NOMINAL_SIGNAL_LEVELS, nominal_signal_level_to_str);
 
-        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_OUT_45_LEVEL_NAME, 0);
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_IN_45_SENSITIVITY_NAME, 0);
         card_cntr
             .add_enum_elems(&elem_id, 1, 1, &labels, None, true)
             .map(|mut elem_id_list| self.1.append(&mut elem_id_list))?;
 
-        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_OUT_67_LEVEL_NAME, 0);
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_IN_67_SENSITIVITY_NAME, 0);
         card_cntr
             .add_enum_elems(&elem_id, 1, 1, &labels, None, true)
             .map(|mut elem_id_list| self.1.append(&mut elem_id_list))?;
 
-        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_OUT_89_LEVEL_NAME, 0);
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_IN_89_SENSITIVITY_NAME, 0);
         card_cntr
             .add_enum_elems(&elem_id, 1, 1, &labels, None, true)
             .map(|mut elem_id_list| self.1.append(&mut elem_id_list))?;
 
-        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_OUT_1011_LEVEL_NAME, 0);
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, LINE_IN_1011_SENSITIVITY_NAME, 0);
         card_cntr
             .add_enum_elems(&elem_id, 1, 1, &labels, None, true)
             .map(|mut elem_id_list| self.1.append(&mut elem_id_list))?;
@@ -353,10 +355,10 @@ impl LineoutCtl {
 
     fn read(&self, elem_id: &ElemId, elem_value: &mut ElemValue) -> Result<bool, Error> {
         match elem_id.name().as_str() {
-            LINE_OUT_45_LEVEL_NAME => Self::read_as_index(elem_value, self.0.data.line_45),
-            LINE_OUT_67_LEVEL_NAME => Self::read_as_index(elem_value, self.0.data.line_67),
-            LINE_OUT_89_LEVEL_NAME => Self::read_as_index(elem_value, self.0.data.line_89),
-            LINE_OUT_1011_LEVEL_NAME => Self::read_as_index(elem_value, self.0.data.line_1011),
+            LINE_IN_45_SENSITIVITY_NAME => Self::read_as_index(elem_value, self.0.data.line_45),
+            LINE_IN_67_SENSITIVITY_NAME => Self::read_as_index(elem_value, self.0.data.line_67),
+            LINE_IN_89_SENSITIVITY_NAME => Self::read_as_index(elem_value, self.0.data.line_89),
+            LINE_IN_1011_SENSITIVITY_NAME => Self::read_as_index(elem_value, self.0.data.line_1011),
             _ => Ok(false),
         }
     }
@@ -379,22 +381,22 @@ impl LineoutCtl {
         timeout_ms: u32,
     ) -> Result<bool, Error> {
         match elem_id.name().as_str() {
-            LINE_OUT_45_LEVEL_NAME => {
+            LINE_IN_45_SENSITIVITY_NAME => {
                 self.write_as_index(req, node, elem_value, timeout_ms, |data, level| {
                     data.line_45 = level
                 })
             }
-            LINE_OUT_67_LEVEL_NAME => {
+            LINE_IN_67_SENSITIVITY_NAME => {
                 self.write_as_index(req, node, elem_value, timeout_ms, |data, level| {
                     data.line_67 = level
                 })
             }
-            LINE_OUT_89_LEVEL_NAME => {
+            LINE_IN_89_SENSITIVITY_NAME => {
                 self.write_as_index(req, node, elem_value, timeout_ms, |data, level| {
                     data.line_89 = level
                 })
             }
-            LINE_OUT_1011_LEVEL_NAME => {
+            LINE_IN_1011_SENSITIVITY_NAME => {
                 self.write_as_index(req, node, elem_value, timeout_ms, |data, level| {
                     data.line_1011 = level
                 })
@@ -462,10 +464,34 @@ impl RemoteCtl {
     const EFFECT_BUTTON_MODES: [RemoteEffectButtonMode; 2] =
         [RemoteEffectButtonMode::Reverb, RemoteEffectButtonMode::Midi];
 
-    // NOTE: by milisecond.
-    const DURATION_MIN: i32 = 10;
-    const DURATION_MAX: i32 = 1000;
-    const DURATION_STEP: i32 = 1;
+    /// TC Near Remote fallback times (wire: milliseconds). "Never" is [`FALLBACK_TO_MASTER_ENABLE_NAME`].
+    const FALLBACK_DURATION_LABELS: [&'static str; 9] = [
+        "1.0 s",
+        "1.5 s",
+        "2.0 s",
+        "2.5 s",
+        "3.0 s",
+        "4.0 s",
+        "5.0 s",
+        "7.5 s",
+        "10.0 s",
+    ];
+    const FALLBACK_DURATIONS_MS: [u32; 9] = [
+        1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000,
+    ];
+
+    fn fallback_duration_ms_to_index(ms: u32) -> u32 {
+        if let Some(pos) = Self::FALLBACK_DURATIONS_MS.iter().position(|&d| d == ms) {
+            return pos as u32;
+        }
+        // Firmware may hold values outside the TC Near preset list; pick the nearest label.
+        Self::FALLBACK_DURATIONS_MS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &d)| ms.abs_diff(d))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    }
 
     const KNOB_PUSH_MODES: [KnobPushMode; 4] = [
         KnobPushMode::Pan,
@@ -522,13 +548,11 @@ impl RemoteCtl {
             0,
         );
         card_cntr
-            .add_int_elems(
+            .add_enum_elems(
                 &elem_id,
                 1,
-                Self::DURATION_MIN,
-                Self::DURATION_MAX,
-                Self::DURATION_STEP,
                 1,
+                &Self::FALLBACK_DURATION_LABELS,
                 None,
                 true,
             )
@@ -573,7 +597,8 @@ impl RemoteCtl {
             }
             FALLBACK_TO_MASTER_DURATION_NAME => {
                 let params = &self.0.data;
-                elem_value.set_int(&[params.fallback_to_master_duration as i32]);
+                let pos = Self::fallback_duration_ms_to_index(params.fallback_to_master_duration);
+                elem_value.set_enum(&[pos]);
                 Ok(true)
             }
             KNOB_PUSH_MODE_NAME => {
@@ -652,7 +677,9 @@ impl RemoteCtl {
             }
             FALLBACK_TO_MASTER_DURATION_NAME => {
                 let mut params = self.0.data.clone();
-                params.fallback_to_master_duration = elem_value.int()[0] as u32;
+                let pos = elem_value.enumerated()[0] as usize;
+                element_at_or_error(&Self::FALLBACK_DURATIONS_MS, pos, "fallback duration")
+                    .map(|&ms| params.fallback_to_master_duration = ms)?;
                 let res = Studiok48Protocol::update_partial_segment(
                     req,
                     node,
@@ -2585,5 +2612,54 @@ impl HwStateCtl {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+impl Studiok48Model {
+    fn test_remote_fallback_duration(&mut self, ms: u32) {
+        self.remote_ctl.0.data.fallback_to_master_duration = ms;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alsactl::CardError;
+
+    #[test]
+    fn fallback_duration_enum_matches_tc_near() {
+        let mut model = Studiok48Model::default();
+        let elem_id = ElemId::new_by_name(
+            ElemIfaceType::Mixer,
+            0,
+            0,
+            FALLBACK_TO_MASTER_DURATION_NAME,
+            0,
+        );
+        let mut val = ElemValue::new();
+
+        for (index, &ms) in RemoteCtl::FALLBACK_DURATIONS_MS.iter().enumerate() {
+            model.test_remote_fallback_duration(ms);
+            assert!(model.read(&elem_id, &mut val).unwrap());
+            assert_eq!(val.enumerated()[0], index as u32, "firmware {ms} ms");
+        }
+    }
+
+    #[test]
+    fn fallback_duration_ms_to_index_roundtrip() {
+        for (index, &ms) in RemoteCtl::FALLBACK_DURATIONS_MS.iter().enumerate() {
+            assert_eq!(RemoteCtl::fallback_duration_ms_to_index(ms), index as u32);
+        }
+        assert_eq!(RemoteCtl::fallback_duration_ms_to_index(500), 0);
+        assert_eq!(RemoteCtl::fallback_duration_ms_to_index(1250), 0);
+    }
+
+    #[test]
+    fn load_requires_alsa_card() {
+        let mut card_cntr = CardCntr::default();
+        let mut model = Studiok48Model::default();
+        let error = model.load(&mut card_cntr).unwrap_err();
+        assert_eq!(error.kind::<CardError>(), Some(CardError::Failed));
     }
 }
