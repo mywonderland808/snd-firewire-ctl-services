@@ -243,7 +243,8 @@ pub type Studiok48ChStripStatesSegment = TcKonnektSegment<StudioChStripStates>;
 /// Segment for state of hardware. 0x2008..0x204b (17 quads).
 pub type Studiok48HwStateSegment = TcKonnektSegment<StudioHwState>;
 
-// NOTE: Segment for meter of remote controller. 0x204c..0x205b (4 quads).
+/// Segment for meter of remote controller. 0x204c..0x205b (4 quads).
+pub type Studiok48RemoteMeterSegment = TcKonnektSegment<StudioRemoteMeter>;
 
 /// Segment for meter of mixer. 0x20b8..0x2137 (32 quads).
 pub type Studiok48MixerMeterSegment = TcKonnektSegment<StudioMixerMeter>;
@@ -277,6 +278,7 @@ segment_default!(Studiok48Protocol, StudioPhysOut);
 segment_default!(Studiok48Protocol, StudioReverbState);
 segment_default!(Studiok48Protocol, StudioChStripStates);
 segment_default!(Studiok48Protocol, StudioHwState);
+segment_default!(Studiok48Protocol, StudioRemoteMeter);
 segment_default!(Studiok48Protocol, StudioMixerMeter);
 segment_default!(Studiok48Protocol, StudioReverbMeter);
 segment_default!(Studiok48Protocol, StudioChStripMeters);
@@ -292,7 +294,8 @@ const STUDIO_CH_STRIP_NOTIFY_23_CHANGE: u32 = 0x00800000;
 // NOTE: 0x01000000 is for tuner.
 // NOTE: 0x02000000 is unidentified.
 const STUDIO_HW_STATE_NOTIFY_FLAG: u32 = 0x04000000;
-// NOTE: 0x08000000 is for remote controller.
+/// Live remote-controller events (SHIFT+USER on/off, etc.).
+pub const STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG: u32 = 0x08000000;
 
 /// Line output level.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1019,6 +1022,8 @@ pub struct StudioMixerState {
     pub src_pairs: [MonitorSrcPair; STUDIO_MIXER_SRC_PAIR_COUNT],
     /// Whethe to mute mixer sources.
     pub mutes: [bool; STUDIO_MIXER_SRC_PAIR_COUNT],
+    /// Mute state for mixer channels 12-23 (remote USER on/off past the 12-slot mute array).
+    pub mutes_high: [bool; STUDIO_MIXER_SRC_PAIR_COUNT],
     /// Whether to mute reverb effect return.
     pub reverb_return_mute: [bool; 3],
     /// Gain of reverb effect return.
@@ -1055,6 +1060,14 @@ impl TcKonnektSegmentSerdes<StudioMixerState> for Studiok48Protocol {
             .filter(|(_, &m)| m)
             .for_each(|(i, _)| {
                 val |= 1 << i;
+            });
+        params
+            .mutes_high
+            .iter()
+            .enumerate()
+            .filter(|(_, &m)| m)
+            .for_each(|(i, _)| {
+                val |= 1 << (i + STUDIO_MIXER_SRC_PAIR_COUNT);
             });
         serialize_u32(&val, &mut raw[672..676]);
         serialize_bool(&params.reverb_return_mute[0], &mut raw[712..716]);
@@ -1096,7 +1109,14 @@ impl TcKonnektSegmentSerdes<StudioMixerState> for Studiok48Protocol {
         let mut val = 0u32;
         deserialize_u32(&mut val, &raw[672..676]);
         params.mutes.iter_mut().enumerate().for_each(|(i, m)| {
-            *m = (val & 1 << i) > 0;
+            *m = (val & (1 << i)) > 0;
+        });
+        let mut val_high = 0u32;
+        deserialize_u32(&mut val_high, &raw[676..680]);
+        // Bits 12–23 live in the low 12 bits of u32@672 (shifted by pair count) on hardware;
+        // also accept u32@676 for firmware builds that split the high mask.
+        params.mutes_high.iter_mut().enumerate().for_each(|(i, m)| {
+            *m = (val & (1 << (i + STUDIO_MIXER_SRC_PAIR_COUNT))) > 0 || (val_high & (1 << i)) > 0;
         });
         deserialize_bool(&mut params.reverb_return_mute[0], &raw[712..716]);
         deserialize_i32(&mut params.reverb_return_gain[0], &raw[716..720]);
@@ -1720,6 +1740,50 @@ impl AsMut<FireWireLedState> for StudioHwState {
     }
 }
 
+/// Live state of remote controller (SHIFT+USER latch, etc.).
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
+pub struct StudioRemoteMeter {
+    /// Latched mute state for SHIFT+USER 1..6.
+    pub user_mutes: [bool; STUDIO_REMOTE_USER_ASSIGN_COUNT],
+}
+
+impl TcKonnektSegmentSerdes<StudioRemoteMeter> for Studiok48Protocol {
+    const NAME: &'static str = "remote-controller-meter";
+    const OFFSET: usize = 0x204c;
+    const SIZE: usize = 16;
+
+    fn serialize(params: &StudioRemoteMeter, raw: &mut [u8]) -> Result<(), String> {
+        let mut val = 0u32;
+        params
+            .user_mutes
+            .iter()
+            .enumerate()
+            .filter(|(_, &m)| m)
+            .for_each(|(i, _)| {
+                val |= 1 << i;
+            });
+        serialize_u32(&val, &mut raw[..4]);
+        Ok(())
+    }
+
+    fn deserialize(params: &mut StudioRemoteMeter, raw: &[u8]) -> Result<(), String> {
+        let mut words = [0u32; 4];
+        for (i, word) in words.iter_mut().enumerate() {
+            deserialize_u32(word, &raw[i * 4..(i + 1) * 4]);
+        }
+        // Latch bits may appear in the first quads; accept any of the low 6 bits set.
+        let latch = words[0] | words[1];
+        params.user_mutes.iter_mut().enumerate().for_each(|(i, m)| {
+            *m = (latch & (1 << i)) > 0;
+        });
+        Ok(())
+    }
+}
+
+impl TcKonnektNotifiedSegmentOperation<StudioRemoteMeter> for Studiok48Protocol {
+    const NOTIFY_FLAG: u32 = STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG;
+}
+
 /// Hardware metering for mixer function.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct StudioMixerMeter {
@@ -1887,10 +1951,33 @@ mod test {
         state.mixer_out[1].vol = -500;
         state.mixer_out[2].vol = MIXER_OUT_VOL_MAX;
         state.mutes[0] = true;
+        state.mutes_high[5] = true;
         state.src_pairs[0].params[0].src = SrcEntry::Analog(0);
         state.src_pairs[0].params[0].gain_to_main = MIXER_OUT_VOL_MIN;
         state.enabled = true;
         assert_segment_roundtrip(&state);
+    }
+
+    /// Channel-indexed mute bits 0–23 share one little-endian u32 at offset 672.
+    #[test]
+    fn studio_mixer_mute_mask_includes_high_channels() {
+        let mut state = StudioMixerState::default();
+        state.mutes[10] = true;
+        state.mutes_high[0] = true; // mixer channel 12
+
+        let mut raw = vec![0u8; segment_size::<StudioMixerState>()];
+        segment_serialize(&state, &mut raw);
+
+        let mut be = [0u8; 4];
+        be.copy_from_slice(&raw[672..676]);
+        let mask = u32::from_be_bytes(be);
+        assert_eq!(mask & (1 << 10), 1 << 10);
+        assert_eq!(mask & (1 << 12), 1 << 12);
+
+        let mut decoded = StudioMixerState::default();
+        segment_deserialize(&mut decoded, &raw);
+        assert!(decoded.mutes[10]);
+        assert!(decoded.mutes_high[0]);
     }
 
     #[test]
@@ -1912,6 +1999,19 @@ mod test {
         state.fallback_to_master_enable = true;
         state.fallback_to_master_duration = 1000;
         state.effect_button_mode = RemoteEffectButtonMode::Midi;
+        assert_segment_roundtrip(&state);
+    }
+
+    #[test]
+    fn studio_segment_roundtrip_remote_meter_default() {
+        assert_segment_roundtrip::<StudioRemoteMeter>(&StudioRemoteMeter::default());
+    }
+
+    #[test]
+    fn studio_segment_roundtrip_remote_meter_user_latch() {
+        let mut state = StudioRemoteMeter::default();
+        state.user_mutes[2] = true;
+        state.user_mutes[5] = true;
         assert_segment_roundtrip(&state);
     }
 
