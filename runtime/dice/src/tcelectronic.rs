@@ -6,6 +6,7 @@ pub mod k24d_model;
 pub mod k8_model;
 pub mod klive_model;
 mod studiok48_src;
+mod remote_user_mute;
 pub mod studiok48_model;
 
 pub mod ch_strip_ctl;

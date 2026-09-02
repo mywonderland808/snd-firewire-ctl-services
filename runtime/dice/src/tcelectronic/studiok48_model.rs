@@ -3,6 +3,7 @@
 
 use {
     super::{
+        remote_user_mute::RemoteUserMuteMirror,
         studiok48_src::{
             studio_mixer_src_entry_labels_for_rate, studio_phys_out_src_entry_labels_for_rate,
             STUDIO_MIXER_SRC_ENTRIES, STUDIO_PHYS_OUT_SRC_ENTRIES,
@@ -36,6 +37,8 @@ pub struct Studiok48Model {
     common_ctl: CommonCtl<Studiok48Protocol>,
     lineout_ctl: LineoutCtl,
     remote_ctl: RemoteCtl,
+    remote_meter_ctl: RemoteMeterCtl,
+    remote_user_mute_mirror: RemoteUserMuteMirror,
     config_ctl: ConfigCtl,
     mixer_state_ctl: MixerStateCtl,
     mixer_meter_ctl: MixerMeterCtl,
@@ -107,6 +110,8 @@ impl CtlModel<(SndDice, FwNode)> for Studiok48Model {
 
         self.lineout_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.remote_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.remote_meter_ctl
+            .cache(&mut self.req, node, TIMEOUT_MS)?;
         self.config_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.mixer_state_ctl
             .cache(&mut self.req, node, TIMEOUT_MS)?;
@@ -162,6 +167,8 @@ impl CtlModel<(SndDice, FwNode)> for Studiok48Model {
             Ok(true)
         } else if self.config_ctl.read(elem_id, elem_value)? {
             Ok(true)
+        } else if elem_id.name().as_str() == SRC_GAIN_NAME {
+            self.read_mixer_input_gain(elem_value)
         } else if self.mixer_state_ctl.read(elem_id, elem_value)? {
             Ok(true)
         } else if self.mixer_meter_ctl.read(elem_id, elem_value)? {
@@ -214,6 +221,8 @@ impl CtlModel<(SndDice, FwNode)> for Studiok48Model {
             .write(&mut self.req, node, elem_id, elem_value, TIMEOUT_MS)?
         {
             Ok(true)
+        } else if elem_id.name().as_str() == SRC_GAIN_NAME {
+            self.write_mixer_input_gain(node, elem_value)
         } else if self.mixer_state_ctl.write(
             &mut self.req,
             node,
@@ -274,6 +283,44 @@ impl Studiok48Model {
     /// runtime from drifting out of sync with it.
     pub fn is_mixer_state_notified(&self, msg: u32) -> bool {
         Studiok48Protocol::is_notified_segment(&self.mixer_state_ctl.0, msg)
+    }
+
+    fn read_mixer_input_gain(&mut self, elem_value: &mut ElemValue) -> Result<bool, Error> {
+        let vals = self.remote_user_mute_mirror.overlay_mixer_input_gain(
+            &self.mixer_state_ctl.0.data,
+            &self.remote_ctl.0.data,
+            &self.remote_meter_ctl.0.data,
+        );
+        elem_value.set_int(&vals);
+        Ok(true)
+    }
+
+    fn write_mixer_input_gain(
+        &mut self,
+        node: &FwNode,
+        elem_value: &ElemValue,
+    ) -> Result<bool, Error> {
+        let mirror_backup = self.remote_user_mute_mirror.clone();
+        let mut params = self.mixer_state_ctl.0.data.clone();
+        self.remote_user_mute_mirror
+            .apply_mixer_input_gain_write(&mut params, elem_value.int());
+        match Studiok48Protocol::update_partial_segment(
+            &mut self.req,
+            node,
+            &params,
+            &mut self.mixer_state_ctl.0,
+            TIMEOUT_MS,
+        ) {
+            Ok(()) => {
+                debug!(params = ?self.mixer_state_ctl.0.data);
+                Ok(true)
+            }
+            Err(err) => {
+                self.remote_user_mute_mirror = mirror_backup;
+                debug!(?err, "mixer-input-gain write failed; mirror restored");
+                Err(err)
+            }
+        }
     }
 
     pub fn defer_program_slot_sync_active(&self) -> bool {
@@ -361,6 +408,9 @@ impl Studiok48Model {
     ) -> Result<(), Error> {
         self.cache_program_slot_recall_segments(node)?;
         self.cache_program_slot_effect_segments(node)?;
+        self.remote_meter_ctl
+            .cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.remote_user_mute_mirror.clear();
         debug!("program slot recall sync complete");
         self.defer_program_slot_sync = false;
         self.clear_program_slot_poll();
@@ -491,10 +541,21 @@ impl NotifyModel<(SndDice, FwNode), u32> for Studiok48Model {
             self.mark_defer_program_slot_sync(body_at_recall);
         }
 
+        if msg & STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG > 0 {
+            self.remote_meter_ctl
+                .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
+            self.mixer_state_ctl
+                .cache(&mut self.req, node, TIMEOUT_MS)?;
+        }
+
         self.config_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
         self.mixer_state_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
+        if Studiok48Protocol::is_notified_segment(&self.mixer_state_ctl.0, msg) {
+            self.remote_meter_ctl
+                .cache(&mut self.req, node, TIMEOUT_MS)?;
+        }
         self.phys_out_ctl
             .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
         self.reverb_state_ctl
@@ -986,6 +1047,31 @@ impl RemoteCtl {
             let res = Studiok48Protocol::cache_whole_segment(req, node, &mut self.0, timeout_ms);
             debug!(params = ?self.0.data, ?res);
             res
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct RemoteMeterCtl(Studiok48RemoteMeterSegment);
+
+impl RemoteMeterCtl {
+    fn cache(&mut self, req: &FwReq, node: &FwNode, timeout_ms: u32) -> Result<(), Error> {
+        let res = Studiok48Protocol::cache_whole_segment(req, node, &mut self.0, timeout_ms);
+        debug!(params = ?self.0.data, ?res);
+        res
+    }
+
+    fn parse_notification(
+        &mut self,
+        req: &FwReq,
+        node: &FwNode,
+        msg: u32,
+        timeout_ms: u32,
+    ) -> Result<(), Error> {
+        if Studiok48Protocol::is_notified_segment(&self.0, msg) {
+            self.cache(req, node, timeout_ms)
         } else {
             Ok(())
         }
@@ -2907,6 +2993,34 @@ impl Studiok48Model {
     fn test_remote_fallback_duration(&mut self, ms: u32) {
         self.remote_ctl.0.data.fallback_to_master_duration = ms;
     }
+
+    fn test_user_assign(&mut self, user: usize, src: SrcEntry) {
+        self.remote_ctl.0.data.user_assigns[user] = src;
+    }
+
+    fn test_mixer_source_at(&mut self, ch: usize, src: SrcEntry, gain: i32) {
+        let pair = ch / 2;
+        let slot = ch % 2;
+        self.mixer_state_ctl.0.data.src_pairs[pair].params[slot].src = src;
+        self.mixer_state_ctl.0.data.src_pairs[pair].params[slot].gain_to_main = gain;
+    }
+
+    fn test_mutes_high(&mut self, ch: usize, muted: bool) {
+        let high = ch - (remote_user_mute::USER_REMOTE_MUTE_MAX_CHANNEL + 1);
+        self.mixer_state_ctl.0.data.mutes_high[high] = muted;
+    }
+
+    fn test_user_remote_latch(&mut self, user: usize, muted: bool) {
+        self.remote_meter_ctl.0.data.user_mutes[user] = muted;
+    }
+
+    fn test_clear_remote_gain_shadow(&mut self) {
+        self.remote_user_mute_mirror.clear();
+    }
+
+    fn test_saved_remote_gain(&self, ch: usize) -> Option<i32> {
+        self.remote_user_mute_mirror.saved_gain(ch)
+    }
 }
 
 #[cfg(test)]
@@ -3039,5 +3153,55 @@ mod tests {
         let mut model = Studiok48Model::default();
         let error = model.load(&mut card_cntr).unwrap_err();
         assert_eq!(error.kind::<CardError>(), Some(CardError::Failed));
+    }
+
+    #[test]
+    fn remote_controller_notify_flag_recognized() {
+        assert_eq!(
+            notify_flag::<StudioRemoteMeter>(),
+            STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG
+        );
+    }
+
+    #[test]
+    fn mixer_input_gain_overlays_mutes_high_for_user_slot() {
+        let mut model = Studiok48Model::default();
+        model.test_user_assign(2, SrcEntry::Analog(8));
+        model.test_mixer_source_at(12, SrcEntry::Analog(8), -200);
+        model.test_mutes_high(12, true);
+
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, SRC_GAIN_NAME, 0);
+        let mut val = ElemValue::new();
+        assert!(model.read(&elem_id, &mut val).unwrap());
+        assert_eq!(val.int()[12], MixerStateCtl::LEVEL_MIN);
+    }
+
+    #[test]
+    fn mixer_input_gain_overlays_user_remote_meter_latch() {
+        let mut model = Studiok48Model::default();
+        model.test_user_assign(2, SrcEntry::Analog(8));
+        model.test_mixer_source_at(12, SrcEntry::Analog(8), -200);
+        model.test_user_remote_latch(2, true);
+
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, SRC_GAIN_NAME, 0);
+        let mut val = ElemValue::new();
+        assert!(model.read(&elem_id, &mut val).unwrap());
+        assert_eq!(val.int()[12], MixerStateCtl::LEVEL_MIN);
+    }
+
+    #[test]
+    fn program_slot_sync_clears_remote_gain_shadow() {
+        let mut model = Studiok48Model::default();
+        model.test_user_assign(2, SrcEntry::Analog(8));
+        model.test_mixer_source_at(12, SrcEntry::Analog(8), -200);
+        model.test_mutes_high(12, true);
+
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, SRC_GAIN_NAME, 0);
+        let mut val = ElemValue::new();
+        assert!(model.read(&elem_id, &mut val).unwrap());
+        assert_eq!(model.test_saved_remote_gain(12), Some(-200));
+
+        model.test_clear_remote_gain_shadow();
+        assert!(model.test_saved_remote_gain(12).is_none());
     }
 }
