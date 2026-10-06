@@ -8,9 +8,6 @@ use {super::*, protocols::tcelectronic::studio::*, tracing::warn};
 /// Last mixer channel index reachable via ``mixer-input-mute`` (channel-indexed layout).
 pub const USER_REMOTE_MUTE_MAX_CHANNEL: usize = 11;
 
-/// Gain at or below this level is treated as remote-ducked (matches k48-mixer UI).
-pub const REMOTE_GAIN_DUCK_THRESHOLD: i32 = -400;
-
 pub const MIXER_INPUT_GAIN_MIN: i32 = -1000;
 
 /// Mixer monitor channels exposed as ``mixer-input-gain`` (``src_pairs`` × 2).
@@ -70,19 +67,14 @@ impl RemoteUserMuteMirror {
             if meter.user_mutes[user_i] {
                 return true;
             }
-            let gain = mixer_monitor_src_params(mixer)
-                .nth(ch)
-                .map(|p| p.gain_to_main)
-                .unwrap_or(0);
-            if gain <= REMOTE_GAIN_DUCK_THRESHOLD {
-                return true;
-            }
         }
+        // Never treat a quiet fader as mute — only mutes_high / remote meter latch.
         false
     }
 
+    /// Explicit mute duck write (strip M / remote path), not a normal level pull.
     fn is_duck_write(val: i32) -> bool {
-        val <= REMOTE_GAIN_DUCK_THRESHOLD
+        val <= MIXER_INPUT_GAIN_MIN
     }
 
     /// Build ALSA ``mixer-input-gain`` values with remote USER duck overlay for ch >= 12.
@@ -99,12 +91,13 @@ impl RemoteUserMuteMirror {
 
         for ch in (USER_REMOTE_MUTE_MAX_CHANNEL + 1)..vals.len() {
             if Self::channel_remote_muted(ch, mixer, meter, &user_map) {
-                if self.saved_gains[ch].is_none() && vals[ch] > REMOTE_GAIN_DUCK_THRESHOLD {
+                if self.saved_gains[ch].is_none() && vals[ch] > MIXER_INPUT_GAIN_MIN {
                     self.saved_gains[ch] = Some(vals[ch]);
                 }
                 vals[ch] = MIXER_INPUT_GAIN_MIN;
             } else if let Some(saved) = self.saved_gains[ch].take() {
-                if vals[ch] <= REMOTE_GAIN_DUCK_THRESHOLD {
+                // Only restore shadow when firmware still shows a ducked min.
+                if vals[ch] <= MIXER_INPUT_GAIN_MIN {
                     vals[ch] = saved;
                 }
             }
@@ -139,15 +132,25 @@ impl RemoteUserMuteMirror {
             }
             if Self::is_duck_write(val) {
                 let current = gain_to_main(params, ch);
-                if self.saved_gains[ch].is_none() && current > REMOTE_GAIN_DUCK_THRESHOLD {
+                if self.saved_gains[ch].is_none() && current > MIXER_INPUT_GAIN_MIN {
                     self.saved_gains[ch] = Some(current);
                 }
                 set_gain_to_main(params, ch, MIXER_INPUT_GAIN_MIN);
                 params.mutes_high[high] = true;
-            } else {
-                let restore = self.saved_gains[ch].take().unwrap_or(val);
+            } else if params.mutes_high[high] {
+                // Unmute: restore shadowed level. UI may send the saved value or 0
+                // as a restore sentinel; a non-zero level write wins as the new gain.
+                let restore = if val == 0 {
+                    self.saved_gains[ch].take().unwrap_or(0)
+                } else {
+                    self.saved_gains[ch] = None;
+                    val
+                };
                 set_gain_to_main(params, ch, restore);
                 params.mutes_high[high] = false;
+            } else {
+                set_gain_to_main(params, ch, val);
+                self.saved_gains[ch] = None;
             }
         }
     }
@@ -231,6 +234,20 @@ mod tests {
     }
 
     #[test]
+    fn quiet_fader_is_not_remote_mute_overlay() {
+        let mut remote = StudioRemote::default();
+        remote.user_assigns[2] = SrcEntry::Analog(8);
+        let meter = StudioRemoteMeter::default();
+        let mut mixer = mixer_with_source_at(12, SrcEntry::Analog(8));
+        mixer.src_pairs[6].params[0].gain_to_main = -619;
+
+        let mut mirror = RemoteUserMuteMirror::default();
+        let vals = mirror.overlay_mixer_input_gain(&mixer, &remote, &meter);
+        assert_eq!(vals[12], -619);
+        assert!(mirror.saved_gains[12].is_none());
+    }
+
+    #[test]
     fn unmute_restores_saved_gain() {
         let remote = StudioRemote::default();
         let meter = StudioRemoteMeter::default();
@@ -263,14 +280,35 @@ mod tests {
     }
 
     #[test]
-    fn write_duck_at_remote_threshold() {
+    fn write_mid_low_level_is_not_mute_duck() {
         let mut mixer = mixer_with_source_at(12, SrcEntry::Analog(8));
         let mut mirror = RemoteUserMuteMirror::default();
         let mut written = [-200i32; 24];
-        written[12] = REMOTE_GAIN_DUCK_THRESHOLD;
+        written[12] = -500;
         mirror.apply_mixer_input_gain_write(&mut mixer, &written);
-        assert!(mixer.mutes_high[0]);
-        assert_eq!(mixer.src_pairs[6].params[0].gain_to_main, MIXER_INPUT_GAIN_MIN);
+        assert!(!mixer.mutes_high[0]);
+        assert_eq!(mixer.src_pairs[6].params[0].gain_to_main, -500);
+        assert!(mirror.saved_gains[12].is_none());
+    }
+
+    #[test]
+    fn write_level_clears_prior_mutes_high() {
+        let mut mixer = mixer_with_source_at(12, SrcEntry::Analog(8));
+        mixer.mutes_high[0] = true;
+        mixer.src_pairs[6].params[0].gain_to_main = MIXER_INPUT_GAIN_MIN;
+        let mut mirror = RemoteUserMuteMirror {
+            saved_gains: {
+                let mut s = [None; 24];
+                s[12] = Some(-200);
+                s
+            },
+        };
+        let mut written = [-1000i32; 24];
+        written[12] = -300;
+        mirror.apply_mixer_input_gain_write(&mut mixer, &written);
+        assert!(!mixer.mutes_high[0]);
+        assert_eq!(mixer.src_pairs[6].params[0].gain_to_main, -300);
+        assert!(mirror.saved_gains[12].is_none());
     }
 
     #[test]
@@ -286,10 +324,30 @@ mod tests {
             },
         };
         let mut written = [-1000i32; 24];
-        written[12] = 0;
+        written[12] = 0; // UI unmute sentinel
         mirror.apply_mixer_input_gain_write(&mut mixer, &written);
         assert!(!mixer.mutes_high[0]);
         assert_eq!(mixer.src_pairs[6].params[0].gain_to_main, -200);
+        assert!(mirror.saved_gains[12].is_none());
+    }
+
+    #[test]
+    fn write_unmute_with_explicit_level() {
+        let mut mixer = mixer_with_source_at(12, SrcEntry::Analog(8));
+        mixer.mutes_high[0] = true;
+        mixer.src_pairs[6].params[0].gain_to_main = MIXER_INPUT_GAIN_MIN;
+        let mut mirror = RemoteUserMuteMirror {
+            saved_gains: {
+                let mut s = [None; 24];
+                s[12] = Some(-200);
+                s
+            },
+        };
+        let mut written = [-1000i32; 24];
+        written[12] = -350; // UI restored / user-set level
+        mirror.apply_mixer_input_gain_write(&mut mixer, &written);
+        assert!(!mixer.mutes_high[0]);
+        assert_eq!(mixer.src_pairs[6].params[0].gain_to_main, -350);
         assert!(mirror.saved_gains[12].is_none());
     }
 
