@@ -542,9 +542,14 @@ impl NotifyModel<(SndDice, FwNode), u32> for Studiok48Model {
         }
 
         if msg & STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG > 0 {
+            // Remote encoder Master/Dim live in phys-out; remote-controller notify
+            // alone does not set STUDIO_PHYS_OUT_NOTIFY_FLAG (0x00100000), so
+            // force-cache phys-out like mixer_state (USER mute/gain path).
             self.remote_meter_ctl
                 .parse_notification(&self.req, node, msg, TIMEOUT_MS)?;
             self.mixer_state_ctl
+                .cache(&mut self.req, node, TIMEOUT_MS)?;
+            self.phys_out_ctl
                 .cache(&mut self.req, node, TIMEOUT_MS)?;
         }
 
@@ -3160,6 +3165,12 @@ mod tests {
         assert_eq!(
             notify_flag::<StudioRemoteMeter>(),
             STUDIO_REMOTE_CONTROLLER_NOTIFY_FLAG
+        );
+        // Master ALSA elems are on phys-out; remote notify must not be mistaken
+        // for phys-out notify (parse_notification force-caches both).
+        assert_ne!(
+            notify_flag::<StudioRemoteMeter>(),
+            notify_flag::<StudioPhysOut>()
         );
     }
 
