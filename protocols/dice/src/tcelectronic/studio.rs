@@ -1800,15 +1800,16 @@ pub struct StudioMixerMeter {
     pub aux_outputs: [i32; 4],
 }
 
+/// Leading reserved quads before src_inputs / outs on the mixer-meter wire.
+const STUDIO_MIXER_METER_RESERVED_QUADS: usize = 1;
+
 impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
     const NAME: &'static str = "mixer-meter";
     const OFFSET: usize = 0x20b8;
     const SIZE: usize = 128;
-    /// Leading reserved quads before src_inputs / outs on the wire.
-    const RESERVED_QUADS: usize = 1;
 
     fn serialize(params: &StudioMixerMeter, raw: &mut [u8]) -> Result<(), String> {
-        for i in 0..Self::RESERVED_QUADS {
+        for i in 0..STUDIO_MIXER_METER_RESERVED_QUADS {
             serialize_i32(&0, &mut raw[(i * 4)..(i * 4 + 4)]);
         }
         params
@@ -1818,7 +1819,7 @@ impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
             .chain(&params.aux_outputs)
             .enumerate()
             .for_each(|(i, level)| {
-                let pos = (i + Self::RESERVED_QUADS) * 4;
+                let pos = (i + STUDIO_MIXER_METER_RESERVED_QUADS) * 4;
                 serialize_i32(level, &mut raw[pos..(pos + 4)])
             });
 
@@ -1833,7 +1834,7 @@ impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
             .chain(&mut params.aux_outputs)
             .enumerate()
             .for_each(|(i, level)| {
-                let pos = (i + Self::RESERVED_QUADS) * 4;
+                let pos = (i + STUDIO_MIXER_METER_RESERVED_QUADS) * 4;
                 deserialize_i32(level, &raw[pos..(pos + 4)])
             });
 
