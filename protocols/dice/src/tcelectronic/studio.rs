@@ -247,6 +247,11 @@ pub type Studiok48HwStateSegment = TcKonnektSegment<StudioHwState>;
 pub type Studiok48RemoteMeterSegment = TcKonnektSegment<StudioRemoteMeter>;
 
 /// Segment for meter of mixer. 0x20b8..0x2137 (32 quads).
+///
+/// Wire layout: 1 reserved quad, then 24 mixer-source levels, 2 main outs, 4 aux
+/// outs (30 payload quads + 1 trailing pad). The leading reserved quad reads as
+/// 0 (0 dBFS) on hardware; treating it as `src_inputs[0]` shifted every meter by
+/// one strip (MIC1 pegged full, Analog-N lighting Analog-(N+1), etc.).
 pub type Studiok48MixerMeterSegment = TcKonnektSegment<StudioMixerMeter>;
 
 // NOTE: Segment for inidentified meter. 0x2138..0x2163 (11 quads).
@@ -1799,8 +1804,13 @@ impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
     const NAME: &'static str = "mixer-meter";
     const OFFSET: usize = 0x20b8;
     const SIZE: usize = 128;
+    /// Leading reserved quads before src_inputs / outs on the wire.
+    const RESERVED_QUADS: usize = 1;
 
     fn serialize(params: &StudioMixerMeter, raw: &mut [u8]) -> Result<(), String> {
+        for i in 0..Self::RESERVED_QUADS {
+            serialize_i32(&0, &mut raw[(i * 4)..(i * 4 + 4)]);
+        }
         params
             .src_inputs
             .iter()
@@ -1808,7 +1818,7 @@ impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
             .chain(&params.aux_outputs)
             .enumerate()
             .for_each(|(i, level)| {
-                let pos = i * 4;
+                let pos = (i + Self::RESERVED_QUADS) * 4;
                 serialize_i32(level, &mut raw[pos..(pos + 4)])
             });
 
@@ -1823,7 +1833,7 @@ impl TcKonnektSegmentSerdes<StudioMixerMeter> for Studiok48Protocol {
             .chain(&mut params.aux_outputs)
             .enumerate()
             .for_each(|(i, level)| {
-                let pos = i * 4;
+                let pos = (i + Self::RESERVED_QUADS) * 4;
                 deserialize_i32(level, &raw[pos..(pos + 4)])
             });
 
@@ -2013,6 +2023,29 @@ mod test {
         state.user_mutes[2] = true;
         state.user_mutes[5] = true;
         assert_segment_roundtrip(&state);
+    }
+
+    #[test]
+    fn studio_segment_roundtrip_mixer_meter_skips_leading_reserved() {
+        let mut state = StudioMixerMeter::default();
+        state.src_inputs[0] = -100;
+        state.src_inputs[11] = -200;
+        state.src_inputs[23] = -300;
+        state.mixer_outputs = [-400, -500];
+        state.aux_outputs = [-600, -700, -800, -900];
+        assert_segment_roundtrip(&state);
+
+        let mut raw = vec![0u8; segment_size::<StudioMixerMeter>()];
+        // Simulate device: reserved quad 0 (= 0 dBFS), then payload.
+        raw[0..4].copy_from_slice(&0i32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(-100i32).to_le_bytes());
+        raw[8..12].copy_from_slice(&(-999i32).to_le_bytes());
+        let mut decoded = StudioMixerMeter::default();
+        segment_deserialize(&mut decoded, &raw);
+        assert_eq!(decoded.src_inputs[0], -100);
+        assert_eq!(decoded.src_inputs[1], -999);
+        // Must not treat reserved 0 as mixer slot 0 (that pegged MIC1 at full scale).
+        assert_ne!(decoded.src_inputs[0], 0);
     }
 
     #[test]
